@@ -52,6 +52,7 @@ class DeltaKinematics:
             r.setup_itersolve('delta_stepper_alloc', a, t[0], t[1])
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
+            toolhead.register_step_generator(s.generate_steps)
         # Setup boundary checks
         self.need_home = True
         self.limit_xy2 = -1.
@@ -183,10 +184,11 @@ class DeltaCalibration:
                              for e, a in zip(endstops, arms)]
     def coordinate_descent_params(self, is_extended):
         # Determine adjustment parameters (for use with coordinate_descent)
-        adj_params = ('radius', 'angle_a', 'angle_b',
+        adj_params = ('radius', 
                       'endstop_a', 'endstop_b', 'endstop_c')
         if is_extended:
-            adj_params += ('arm_a', 'arm_b', 'arm_c')
+            adj_params += ('arm_a', 'arm_b', 'arm_c',
+                           'angle_a', 'angle_b', 'angle_c')
         params = { 'radius': self.radius }
         for i, axis in enumerate('abc'):
             params['angle_'+axis] = self.angles[i]

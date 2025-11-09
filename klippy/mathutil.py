@@ -12,18 +12,21 @@ import queuelogger
 ######################################################################
 
 # Helper code that implements coordinate descent
-def coordinate_descent(adj_params, params, error_func):
+def coordinate_descent(adj_params, params, error_func, gcode=None):
     # Define potential changes
     params = dict(params)
     dp = {param_name: 1. for param_name in adj_params}
     # Calculate the error
     best_err = error_func(params)
-    logging.info("Coordinate descent initial error: %s", best_err)
+    if gcode:
+        gcode.respond_info("Coordinate descent initial error: %s" % (best_err,))
+    else:
+        logging.info("Coordinate descent initial error: %s", best_err)
 
     threshold = 0.00001
     rounds = 0
 
-    while sum(dp.values()) > threshold and rounds < 10000:
+    while sum(dp.values()) > threshold and rounds < 100:
         rounds += 1
         for param_name in adj_params:
             orig = params[param_name]
@@ -43,18 +46,23 @@ def coordinate_descent(adj_params, params, error_func):
                 continue
             params[param_name] = orig
             dp[param_name] *= 0.9
-    logging.info("Coordinate descent best_err: %s  rounds: %d",
-                 best_err, rounds)
+        gcode.respond_info("Delta error: %s   Rounds: %d" % (best_err, rounds))
+    if gcode:
+        gcode.respond_info("Coordinate descent best_err: %s  rounds: %d" % (best_err, rounds))
+    else:
+        logging.info("Coordinate descent best_err: %s  rounds: %d",
+                     best_err, rounds)
     return params
 
 # Helper to run the coordinate descent function in a background
 # process so that it does not block the main thread.
 def background_coordinate_descent(printer, adj_params, params, error_func):
     parent_conn, child_conn = multiprocessing.Pipe()
+    gcode = printer.lookup_object("gcode")
     def wrapper():
         queuelogger.clear_bg_logging()
         try:
-            res = coordinate_descent(adj_params, params, error_func)
+            res = coordinate_descent(adj_params, params, error_func, gcode)
         except:
             child_conn.send((True, traceback.format_exc()))
             child_conn.close()

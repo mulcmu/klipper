@@ -7,6 +7,9 @@ import math, logging, collections
 import mathutil
 from . import probe
 
+#import skspatial
+from skspatial.objects import Plane
+
 # A "stable position" is a 3-tuple containing the number of steps
 # taken since hitting the endstop on each delta tower.  Delta
 # calibration uses this coordinate system because it allows a position
@@ -15,7 +18,7 @@ from . import probe
 # Load a stable position from a config entry
 def load_config_stable(config, option):
     return config.getfloatlist(option, count=3)
-
+ 
 
 ######################################################################
 # Delta calibration object
@@ -29,6 +32,8 @@ MeasureRidgeRadius = 5. - .5
 
 # How much to prefer a distance measurement over a height measurement
 MEASURE_WEIGHT = 0.5
+
+HexagonProbePattern_37points= [(0.31111, 0.48497), (-0.31111, 0.0), (0.15556, 0.24249), (-0.46667, 0.72746), (-0.46667, -0.72746), (0.62222, 0.0), (0.15556, -0.24249), (-0.62222, 0.0), (0.0, -0.48497), (0.0, 0.96995), (-0.15556, 0.24249), (0.77778, 0.24249), (0.77778, -0.24249), (0.0, 0.48497), (0.0, -0.96995), (0.46667, 0.72746), (-0.15556, -0.24249), (0.46667, -0.72746), (-0.31111, -0.48497), (0.31111, 0.0), (-0.46667, 0.24249), (0.15556, 0.72746), (-0.46667, -0.24249), (-0.31111, 0.48497), (-0.93333, 0.0), (0.62222, -0.48497), (0.15556, -0.72746), (0.62222, 0.48497), (-0.62222, -0.48497), (-0.62222, 0.48497), (0.0, 0.0), (0.46667, 0.24249), (0.31111, -0.48497), (-0.15556, 0.72746), (-0.15556, -0.72746), (0.93333, 0.0), (0.46667, -0.24249), (-0.77778, 0.24249), (-0.77778, -0.24249)]
 
 # Convert distance measurements made on the calibration object to
 # 3-tuples of (actual_distance, stable_position1, stable_position2)
@@ -80,17 +85,32 @@ class DeltaCalibrate:
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
-        # Calculate default probing points
+        # Calculate probing points
+        # 37 point probe pattern:
         radius = config.getfloat('radius', above=0.)
-        points = [(0., 0.)]
-        scatter = [.95, .90, .85, .70, .75, .80]
-        for i in range(6):
-            r = math.radians(90. + 60. * i)
-            dist = radius * scatter[i]
-            points.append((math.cos(r) * dist, math.sin(r) * dist))
+ 
+        # points = [(0., 0.)]
+        # dist = radius 
+        # for i in range(12):
+        #     r = math.radians(90. + 30. * i)
+        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+        
+        # dist = radius * 0.7
+        # for i in range(12):
+        #     r = math.radians(90. + 30. * i + 15.)
+        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+
+        # dist = radius * 0.3
+        # for i in range(12):
+        #     r = math.radians(90. + 30. * i)
+        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+        
+        points = [(x * radius, y * radius) for x, y in HexagonProbePattern_37points]
+
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
         self.probe_helper.minimum_points(3)
+        
         # Restore probe stable positions
         self.last_probe_positions = []
         for i in range(999):
@@ -181,16 +201,35 @@ class DeltaCalibrate:
                 getpos = delta_params.get_position_from_stable
                 # Calculate z height errors
                 total_error = 0.
+                
+                bed_points = []
+                #find best fit plane for height positions
                 for z_offset, stable_pos in height_positions:
                     x, y, z = getpos(stable_pos)
-                    total_error += (z - z_offset)**2
+                    bed_points.append([x, y, z])
+
+                plane = Plane.best_fit(bed_points)
+                
+                if plane.normal[2] < 0:
+                    plane = Plane(plane.point, -plane.normal)
+
+                for z_offset, stable_pos in height_positions:
+                    x, y, z = getpos(stable_pos)
+                    plane_offset = plane.distance_point_signed([x, y, z])
+                    total_error += (z - plane_offset)**2
+                
                 total_error *= z_weight
                 # Calculate distance errors
                 for dist, stable_pos1, stable_pos2 in distances:
                     x1, y1, z1 = getpos(stable_pos1)
                     x2, y2, z2 = getpos(stable_pos2)
-                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2)
                     total_error += (d - dist)**2
+                
+                #get printer gcode object
+                # gcode = self.printer.lookup_object('gcode')
+                # gcode.respond_info("Delta error: %.6f" % total_error, log=False)
+
                 return total_error
             except ValueError:
                 return 9999999999999.9
