@@ -277,18 +277,13 @@ max_z_velocity:
 #minimum_z_position: 0
 #   The minimum Z position that the user may command the head to move
 #   to. The default is 0.
-delta_radius:
-#   Radius (in mm) of the horizontal circle formed by the three linear
-#   axis towers. This parameter may also be calculated as:
-#    delta_radius = smooth_rod_offset - effector_offset - carriage_offset
-#   This parameter must be provided.
 #print_radius:
 #   The radius (in mm) of valid toolhead XY coordinates. One may use
 #   this setting to customize the range checking of toolhead moves. If
 #   a large value is specified here then it may be possible to command
 #   the toolhead into a collision with a tower. The default is to use
-#   delta_radius for print_radius (which would normally prevent a
-#   tower collision).
+#   the smallest configured tower radius for print_radius (which would
+#   normally prevent a tower collision).
 
 # The stepper_a section describes the stepper controlling the front
 # left tower (at 210 degrees). This section also controls the homing
@@ -305,6 +300,13 @@ arm_length:
 #   print head. This parameter must be provided for stepper_a; for
 #   stepper_b and stepper_c this parameter defaults to the value
 #   specified for stepper_a.
+radius:
+#   Radius (in mm) of the horizontal circle defined by this tower. This
+#   parameter may also be calculated as:
+#     radius = smooth_rod_offset - effector_offset - carriage_offset
+#   This parameter must be provided for stepper_a; for stepper_b and
+#   stepper_c this parameter defaults to the value specified for
+#   stepper_a.
 #angle:
 #   This option specifies the angle (in degrees) that the tower is
 #   at. The default is 210 for stepper_a, 330 for stepper_b, and 90

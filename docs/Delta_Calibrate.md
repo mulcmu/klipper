@@ -4,7 +4,7 @@ This document describes Klipper's automatic calibration system for
 "delta" style printers.
 
 Delta calibration involves finding the tower endstop positions, tower
-angles, delta radius, and delta arm lengths. These settings control
+angles, tower radii, and delta arm lengths. These settings control
 printer motion on a delta printer. Each one of these parameters has a
 non-obvious and non-linear impact and it is difficult to calibrate
 them manually. In contrast, the software calibration code can provide
@@ -42,11 +42,10 @@ then be sure to rerun probe calibration after any delta calibration.
 
 Klipper has a DELTA_CALIBRATE command that can perform basic delta
 calibration. This command probes seven different points on the bed and
-calculates new values for the tower angles, tower endstops, and delta
-radius.
+calculates new values for the tower angles and tower endstops.
 
 In order to perform this calibration the initial delta parameters (arm
-lengths, radius, and endstop positions) must be provided and they
+lengths, radii, and endstop positions) must be provided and they
 should have an accuracy to within a few millimeters. Most delta
 printer kits will provide these parameters - configure the printer
 with these initial defaults and then go on to run the DELTA_CALIBRATE
@@ -89,11 +88,13 @@ functionality.
 The basic delta calibration generally does a good job of calculating
 delta parameters such that the nozzle is the correct distance from the
 bed. However, it does not attempt to calibrate X and Y dimensional
-accuracy. It's a good idea to perform an enhanced delta calibration to
-verify dimensional accuracy.
+accuracy or adjust tower radii. It's a good idea to perform an
+enhanced delta calibration to verify dimensional accuracy.
 
 This calibration procedure requires printing a test object and
-measuring parts of that test object with digital calipers.
+measuring parts of that test object with digital calipers. The enhanced
+solve may adjust the per-tower radii along with the arm lengths and
+tower angles.
 
 Prior to running an enhanced delta calibration one must run the basic
 delta calibration (via the DELTA_CALIBRATE command) and save the
