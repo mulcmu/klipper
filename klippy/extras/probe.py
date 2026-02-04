@@ -472,6 +472,27 @@ class ProbePointsHelper:
             nextpos[0] -= self.probe_offsets[0]
             nextpos[1] -= self.probe_offsets[1]
         self._move(nextpos, self.speed)
+        self._apply_tension_cycle()
+
+    def _apply_tension_cycle(self):
+        # Sweep X and Y ±1mm a few times to help equalize belt tension
+        toolhead = self.printer.lookup_object('toolhead')
+        start_pos = toolhead.get_position()
+        x0, y0 = start_pos[0], start_pos[1]
+        sweep_delta = 1.0
+        sweep_cycles = 7
+        for _ in range(sweep_cycles):
+            # sweep X
+            self._move([x0 + sweep_delta, None, None], self.speed)
+            self._move([x0 - sweep_delta, None, None], self.speed)
+            self._move([x0, y0, None], self.speed)
+            # sweep Y
+            self._move([None, y0 + sweep_delta, None], self.speed)
+            self._move([None, y0 - sweep_delta, None], self.speed)
+            self._move([x0, y0, None], self.speed)
+      
+   
+
     def start_probe(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)
         # Lookup objects

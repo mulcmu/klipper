@@ -26,7 +26,7 @@ def coordinate_descent(adj_params, params, error_func, gcode=None):
     threshold = 0.00001
     rounds = 0
 
-    while sum(dp.values()) > threshold and rounds < 100:
+    while sum(dp.values()) > threshold and rounds < 1000:
         rounds += 1
         for param_name in adj_params:
             orig = params[param_name]
@@ -46,7 +46,8 @@ def coordinate_descent(adj_params, params, error_func, gcode=None):
                 continue
             params[param_name] = orig
             dp[param_name] *= 0.9
-        gcode.respond_info("Delta error: %s   Rounds: %d" % (best_err, rounds))
+        if rounds % 25 == 0:
+            gcode.respond_info("Delta error: %s   Rounds: %d" % (best_err, rounds))
     if gcode:
         gcode.respond_info("Coordinate descent best_err: %s  rounds: %d" % (best_err, rounds))
     else:
