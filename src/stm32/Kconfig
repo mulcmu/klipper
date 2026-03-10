@@ -113,6 +113,34 @@ choice
         select MACH_STM32F1
 endchoice
 
+config STM32F072_CLOCK_OUT_PA3
+    bool "Mellow ALPS Hack - PA3 Clock Output"
+    depends on MACH_STM32F072
+    help
+        Enable selectable frequencies (2/4/6/8MHz) clock output assuming the 
+        MCU runs from  8MHz external crystal. Uses PA3 and TIM15 which will 
+        no longer be available for other features when this option is enabled.
+
+choice
+    prompt "PA3 clock frequency (MHz)" if STM32F072_CLOCK_OUT_PA3
+    config STM32F072_CLOCK_OUT_PA3_FREQ_2MHZ
+        bool "2"
+    config STM32F072_CLOCK_OUT_PA3_FREQ_4MHZ
+        bool "4"
+    config STM32F072_CLOCK_OUT_PA3_FREQ_6MHZ
+        bool "6"
+    config STM32F072_CLOCK_OUT_PA3_FREQ_8MHZ
+        bool "8"
+endchoice
+
+config STM32F072_CLOCK_OUT_PA3_FREQ
+    int
+    default 2 if STM32F072_CLOCK_OUT_PA3_FREQ_2MHZ
+    default 4 if STM32F072_CLOCK_OUT_PA3_FREQ_4MHZ
+    default 6 if STM32F072_CLOCK_OUT_PA3_FREQ_6MHZ
+    default 8 if STM32F072_CLOCK_OUT_PA3_FREQ_8MHZ
+    default 0
+
 config MACH_STM32F103x6
     depends on LOW_LEVEL_OPTIONS && MACH_STM32F103
     bool "Only 10KiB of RAM (for rare stm32f103x6 variant)"

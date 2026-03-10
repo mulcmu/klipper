@@ -95,6 +95,38 @@ pll_setup(void)
     RCC->CFGR3 = cfgr3;
 }
 
+#if CONFIG_STM32F072_CLOCK_OUT_PA3
+static void
+stm32f072_clockout_setup(void)
+{
+    // Configure PA3 (TIM15_CH2) for a fixed square wave (ARR derived from freq)
+    enable_pclock(TIM15_BASE);
+    gpio_peripheral(GPIO('A', 3), GPIO_FUNCTION(0) | GPIO_HIGH_SPEED, 0);
+    TIM15->CR1 = 0;
+    TIM15->PSC = 0;
+
+    uint32_t freq_hz = CONFIG_STM32F072_CLOCK_OUT_PA3_FREQ * 1000000U;
+    if (!freq_hz || CONFIG_CLOCK_FREQ < freq_hz * 2U)
+        freq_hz = 8000000U; // Fallback safeguard
+    uint32_t period_ticks = CONFIG_CLOCK_FREQ / freq_hz;
+    if (period_ticks < 2)
+        period_ticks = 2;
+    uint32_t arr = period_ticks - 1;
+    uint32_t ccr = period_ticks / 2;
+
+    TIM15->ARR = arr;
+    TIM15->CCR2 = ccr;
+    TIM15->CNT = 0;
+    TIM15->CCMR1 = (TIM15->CCMR1 & ~(TIM_CCMR1_OC2M | TIM_CCMR1_CC2S))
+        | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE;
+    TIM15->CCER = (TIM15->CCER & ~(TIM_CCER_CC2P | TIM_CCER_CC2NP))
+        | TIM_CCER_CC2E;
+    TIM15->BDTR |= TIM_BDTR_MOE;
+    TIM15->EGR = TIM_EGR_UG;
+    TIM15->CR1 |= TIM_CR1_ARPE | TIM_CR1_CEN;
+}
+#endif
+
 // Configure and enable internal 48Mhz clock on the stm32f042
 static void
 hsi48_setup(void)
@@ -183,6 +215,10 @@ armcm_main(void)
         hsi48_setup();
     else
         pll_setup();
+
+#if CONFIG_STM32F072_CLOCK_OUT_PA3
+    stm32f072_clockout_setup();
+#endif
 
     // Turn on hsi14 oscillator for ADC
     hsi14_setup();

@@ -5,7 +5,6 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging
 import stepper, mathutil
-import random
 
 # Slow moves once the ratio of tower to XY movement exceeds SLOW_RATIO
 SLOW_RATIO = 3.
@@ -31,31 +30,25 @@ class DeltaKinematics:
             above=0., maxval=self.max_velocity)
         self.max_z_accel = config.getfloat('max_z_accel', self.max_accel,
                                           above=0., maxval=self.max_accel)
+        self.tilts = [0., 0.]
         # Read radius and arm lengths
-        radius_a = stepper_configs[0].getfloat('radius', above=0.)
-        self.tower_radii = radii = [
-            sconfig.getfloat('radius', radius_a, above=0.)
-            for sconfig in stepper_configs]
-        self.radius = min(radii)
-        print_radius = config.getfloat('print_radius', self.radius, above=0.)
-        arm_length_a = stepper_configs[0].getfloat('arm_length',
-                                                  above=radii[0])
+        self.radius = radius = config.getfloat('delta_radius', above=0.)
+        print_radius = config.getfloat('print_radius', radius, above=0.)
+        arm_length_a = stepper_configs[0].getfloat('arm_length', above=radius)
         self.arm_lengths = arm_lengths = [
-            sconfig.getfloat('arm_length', arm_length_a, above=radius_val)
-            for sconfig, radius_val in zip(stepper_configs, radii)]
+            sconfig.getfloat('arm_length', arm_length_a, above=radius)
+            for sconfig in stepper_configs]
         self.arm2 = [arm**2 for arm in arm_lengths]
-        self.abs_endstops = [
-            (rail.get_homing_info().position_endstop
-             + math.sqrt(arm2 - tower_radius**2))
-            for rail, arm2, tower_radius in zip(self.rails, self.arm2, radii)]
+        self.abs_endstops = [(rail.get_homing_info().position_endstop
+                              + math.sqrt(arm2 - radius**2))
+                             for rail, arm2 in zip(self.rails, self.arm2)]
         # Determine tower locations in cartesian space
         self.angles = [sconfig.getfloat('angle', angle)
                        for sconfig, angle in zip(stepper_configs,
                                                  [210., 330., 90.])]
-        self.towers = [
-            (math.cos(math.radians(angle)) * tower_radius,
-             math.sin(math.radians(angle)) * tower_radius)
-            for angle, tower_radius in zip(self.angles, radii)]
+        self.towers = [(math.cos(math.radians(angle)) * radius,
+                        math.sin(math.radians(angle)) * radius)
+                       for angle in self.angles]
         for r, a, t in zip(self.rails, self.arm2, self.towers):
             r.setup_itersolve('delta_stepper_alloc', a, t[0], t[1])
         for s in self.get_steppers():
@@ -73,7 +66,6 @@ class DeltaKinematics:
                             for ep, arm in zip(self.abs_endstops, arm_lengths)])
         self.min_arm_length = min_arm_length = min(arm_lengths)
         self.min_arm2 = min_arm_length**2
-        self.tilt = [0.0, 0.0]
         logging.info(
             "Delta max build height %.2fmm (radius tapered above %.2fmm)"
             % (self.max_z, self.limit_z))
@@ -85,20 +77,22 @@ class DeltaKinematics:
         def ratio_to_xy(ratio):
             return (ratio * math.sqrt(min_arm_length**2 / (ratio**2 + 1.)
                                       - half_min_step_dist**2)
-                    + half_min_step_dist - self.radius)
+                    + half_min_step_dist - radius)
         self.slow_xy2 = ratio_to_xy(SLOW_RATIO)**2
         self.very_slow_xy2 = ratio_to_xy(2. * SLOW_RATIO)**2
-        self.max_xy2 = min(print_radius, min_arm_length - self.radius,
+        self.max_xy2 = min(print_radius, min_arm_length - radius,
                            ratio_to_xy(4. * SLOW_RATIO))**2
         max_xy = math.sqrt(self.max_xy2)
         logging.info("Delta max build radius %.2fmm (moves slowed past %.2fmm"
                      " and %.2fmm)"
                      % (max_xy, math.sqrt(self.slow_xy2),
                         math.sqrt(self.very_slow_xy2)))
-        # self.axes_min = toolhead.Coord((-max_xy, -max_xy, self.min_z))
-        # self.axes_max = toolhead.Coord((max_xy, max_xy, self.max_z))
-        self.axes_min = toolhead.Coord(-max_xy, -max_xy, self.min_z, 0.)
-        self.axes_max = toolhead.Coord(max_xy, max_xy, self.max_z, 0.)        
+        try:
+            self.axes_min = toolhead.Coord([-max_xy, -max_xy, self.min_z, 0.])
+            self.axes_max = toolhead.Coord([max_xy, max_xy, self.max_z, 0.])
+        except TypeError:
+            self.axes_min = toolhead.Coord(-max_xy, -max_xy, self.min_z, 0.)
+            self.axes_max = toolhead.Coord(max_xy, max_xy, self.max_z, 0.)
         self.set_position([0., 0., 0.], "")
     def get_steppers(self):
         return [s for rail in self.rails for s in rail.get_steppers()]
@@ -174,69 +168,55 @@ class DeltaKinematics:
                     for rail in self.rails]
         stepdists = [rail.get_steppers()[0].get_step_dist()
                      for rail in self.rails]
-        return DeltaCalibration(self.tower_radii, self.angles,
-                                self.arm_lengths, endstops, stepdists, self.tilt)
+        return DeltaCalibration(self.radius, self.angles, self.arm_lengths,
+                                endstops, stepdists, self.tilts)
 
 # Delta parameter calibration for DELTA_CALIBRATE tool
 class DeltaCalibration:
-    def __init__(self, radii, angles, arms, endstops, stepdists, tilt):
-        self.radii = list(radii)
-        self.radius = min(self.radii)
-        
-        # Constrain angles so that one angle is at 210, 330, or 90 degrees
-        angle_errors = []
-        angle_errors.append(210.0-angles[0])
-        angle_errors.append(330.0-angles[1])
-        angle_errors.append(90.0 -angles[2])    
-        ang_offset = sum(angle_errors) - min(angle_errors) - max(angle_errors)
-        angles[0] += ang_offset
-        angles[1] += ang_offset
-        angles[2] += ang_offset
-        
-        self.angles = angles
+    def __init__(self, radius, angles, arms, endstops, stepdists, tilts):
+        self.radius = radius
+        #Normalize angles for bulk rotations
+        angle_rotation = [a - r  for a, r in zip(angles, [210., 330., 90.])]
+        angle_correction = sum(angle_rotation) - min(angle_rotation) - max(angle_rotation)
+        self.angles = [a - angle_correction for a in angles]
         self.arms = arms
         self.endstops = endstops
         self.stepdists = stepdists
         # Calculate the XY cartesian coordinates of the delta towers
         radian_angles = [math.radians(a) for a in angles]
-        self.towers = [
-            (math.cos(a) * tower_radius, math.sin(a) * tower_radius)
-            for a, tower_radius in zip(radian_angles, self.radii)]
+        self.towers = [(math.cos(a) * radius, math.sin(a) * radius)
+                       for a in radian_angles]
         # Calculate the absolute Z height of each tower endstop
-        self.abs_endstops = [
-            e + math.sqrt(a**2 - tower_radius**2)
-            for e, a, tower_radius in zip(endstops, arms, self.radii)]
-        self.tilt = tilt
+        radius2 = radius**2
+        self.abs_endstops = [e + math.sqrt(a**2 - radius2)
+                             for e, a in zip(endstops, arms)]
+        self.tilts = tilts
     def coordinate_descent_params(self, is_extended):
-        adj_params = [
-            'endstop_a', 'endstop_b', 'endstop_c',
-            'radius_a', 'radius_b', 'radius_c']
+        # Determine adjustment parameters (for use with coordinate_descent)
+        adj_params = ('radius', 
+                      'endstop_a', 'endstop_b', 'endstop_c')
+                    #   'tilt_x', 'tilt_y')
         if is_extended:
-            adj_params = [    #+= standard
-                'arm_a', 'arm_b', 'arm_c',
-                'angle_a', 'angle_b', 'angle_c',
-                'tilt_x', 'tilt_y']
-        random.shuffle(adj_params)  # runtime shuffle
-        adj_params = tuple(adj_params)
-        params = {}
+            adj_params += ('arm_a', 'arm_b', 'arm_c',
+                           'angle_a', 'angle_b', 'angle_c')
+        params = { 'radius': self.radius }
         for i, axis in enumerate('abc'):
-            params['radius_'+axis] = self.radii[i]
             params['angle_'+axis] = self.angles[i]
             params['arm_'+axis] = self.arms[i]
             params['endstop_'+axis] = self.endstops[i]
             params['stepdist_'+axis] = self.stepdists[i]
-            params['tilt_x'] = self.tilt[0]
-            params['tilt_y'] = self.tilt[1]
+        params['tilt_x'] = self.tilts[0]
+        params['tilt_y'] = self.tilts[1]
         return adj_params, params
     def new_calibration(self, params):
         # Create a new calibration object from coordinate_descent params
+        radius = params['radius']
         angles = [params['angle_'+a] for a in 'abc']
         arms = [params['arm_'+a] for a in 'abc']
         endstops = [params['endstop_'+a] for a in 'abc']
         stepdists = [params['stepdist_'+a] for a in 'abc']
-        radii = [params['radius_'+a] for a in 'abc']
-        tilt = [params['tilt_x'], params['tilt_y']]
-        return DeltaCalibration(radii, angles, arms, endstops, stepdists, tilt)
+        tilts = [params['tilt_x'], params['tilt_y']]
+        return DeltaCalibration(radius, angles, arms, endstops, stepdists, tilts)
     def get_position_from_stable(self, stable_position):
         # Return cartesian coordinates for the given stable_position
         sphere_coords = [
@@ -254,9 +234,8 @@ class DeltaCalibration:
                                       self.abs_endstops, steppos)]
     def save_state(self, configfile):
         # Save the current parameters (for use with SAVE_CONFIG)
+        configfile.set('printer', 'delta_radius', "%.6f" % (self.radius,))
         for i, axis in enumerate('abc'):
-            configfile.set('stepper_'+axis, 'radius',
-                           "%.6f" % (self.radii[i],))
             configfile.set('stepper_'+axis, 'angle', "%.6f" % (self.angles[i],))
             configfile.set('stepper_'+axis, 'arm_length',
                            "%.6f" % (self.arms[i],))
@@ -264,14 +243,14 @@ class DeltaCalibration:
                            "%.6f" % (self.endstops[i],))
         gcode = configfile.get_printer().lookup_object("gcode")
         gcode.respond_info(
-            "stepper_a: position_endstop: %.6f angle: %.6f arm_length: %.6f radius: %.6f\n"
-            "stepper_b: position_endstop: %.6f angle: %.6f arm_length: %.6f radius: %.6f\n"
-            "stepper_c: position_endstop: %.6f angle: %.6f arm_length: %.6f radius: %.6f\n"
-            "tilt_x: %.6f    tilt_y: %.6f"
-            % (self.endstops[0], self.angles[0], self.arms[0], self.radii[0],
-               self.endstops[1], self.angles[1], self.arms[1], self.radii[1],
-               self.endstops[2], self.angles[2], self.arms[2], self.radii[2],
-               self.tilt[0]*0.001, self.tilt[1]*0.001))
+            "stepper_a: position_endstop: %.6f angle: %.6f arm_length: %.6f\n"
+            "stepper_b: position_endstop: %.6f angle: %.6f arm_length: %.6f\n"
+            "stepper_c: position_endstop: %.6f angle: %.6f arm_length: %.6f\n"
+            "delta_radius: %.6f tilt_x: %.6f tilt_y: %.6f"
+            % (self.endstops[0], self.angles[0], self.arms[0],
+               self.endstops[1], self.angles[1], self.arms[1],
+               self.endstops[2], self.angles[2], self.arms[2],
+               self.radius, self.tilts[0]/1000., self.tilts[1]/1000.))
 
 def load_kinematics(toolhead, config):
     return DeltaKinematics(toolhead, config)

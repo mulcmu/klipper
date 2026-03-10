@@ -93,23 +93,23 @@ class DeltaCalibrate:
         # # # 37 point probe pattern:
         radius = config.getfloat('radius', above=0.)
  
-        # points = [(0., 0.)]
-        # dist = radius 
-        # for i in range(12):
-        #     r = math.radians(90. + 30. * i)
-        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+        points = [(0., 0.)]
+        dist = radius 
+        for i in range(12):
+            r = math.radians(90. + 30. * i)
+            points.append((math.cos(r) * dist, math.sin(r) * dist))
         
-        # dist = radius * 0.7
-        # for i in range(12):
-        #     r = math.radians(90. + 30. * i + 15.)
-        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+        dist = radius * 0.7
+        for i in range(12):
+            r = math.radians(90. + 30. * i + 15.)
+            points.append((math.cos(r) * dist, math.sin(r) * dist))
 
-        # dist = radius * 0.3
-        # for i in range(12):
-        #     r = math.radians(90. + 30. * i)
-        #     points.append((math.cos(r) * dist, math.sin(r) * dist))
+        dist = radius * 0.3
+        for i in range(12):
+            r = math.radians(90. + 30. * i)
+            points.append((math.cos(r) * dist, math.sin(r) * dist))
         
-        points = [(x * radius, y * radius) for x, y in HexagonProbePattern_61points]
+        # points = [(x * radius, y * radius) for x, y in HexagonProbePattern_61points]
 
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
@@ -194,53 +194,31 @@ class DeltaCalibrate:
         logging.info("Calculating delta_calibrate with:\n%s\n%s\n"
                      "Initial delta_calibrate parameters: %s",
                      height_positions, distances, params)
-        z_weight = 0.5
-        if distances:
-            z_weight = len(distances) / (MEASURE_WEIGHT * len(probe_positions))
-        
-
-        
-        
         # Perform coordinate descent
         def delta_errorfunc(params):
             try:
-                # Build new delta_params for params under test
                 delta_params = orig_delta_params.new_calibration(params)
                 getpos = delta_params.get_position_from_stable
-                
-                arms = [arm for arm in delta_params.arms]
-                arm2 = [arm**2 for arm in delta_params.arms]
-                arm_r =[r for r in delta_params.radii]   
-                             
-                # Calculate z height errors
-                total_error = 0.
-                
-                #Error metric for height is average and stddev of z deviations
+
                 z_errors = []
                 for z_offset, stable_pos in height_positions:
                     x, y, z = getpos(stable_pos)
-                    # z += x * params['tilt_x']*.001 + y * params['tilt_y']*.001
+                    #add bed tilt correction to z
+                    z -= (x * 0.001 * delta_params.tilts[0] + y * 0.001 * delta_params.tilts[1])
                     z_errors.append((z - z_offset)**2)
-                
-                error_height= 100 *sum(z_errors) #/ len(z_errors)
-                total_error += error_height
- 
-                z_errors=[]
-                # Calculate distance errors
-                if len(distances) == 0:
-                    return 9999999999999.9
+                error_height = 100. * sum(z_errors)
+
+                z_errors = []
                 for dist, stable_pos1, stable_pos2 in distances:
                     x1, y1, z1 = getpos(stable_pos1)
                     x2, y2, z2 = getpos(stable_pos2)
-                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2 )
+                    d = math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
                     z_errors.append((d - dist)**2)
-                
-                error_distance = 100 * sum(z_errors) #/ len(z_errors)
-                total_error += error_distance
+                error_distance = 100. * sum(z_errors)
 
-                return total_error
+                return [error_height, error_distance]
             except ValueError:
-                return 9999999999999.9
+                return [9999999999999.9, 9999999999999.9]
         new_params = mathutil.background_coordinate_descent(
             self.printer, adj_params, params, delta_errorfunc)
         # Log and report results

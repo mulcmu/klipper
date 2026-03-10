@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging, multiprocessing, traceback
 import queuelogger
+import random
 
 
 ######################################################################
@@ -13,46 +14,95 @@ import queuelogger
 
 # Helper code that implements coordinate descent
 def coordinate_descent(adj_params, params, error_func, gcode=None):
-    # Define potential changes
     params = dict(params)
-    dp = {param_name: 1. for param_name in adj_params}
-    # Calculate the error
     best_err = error_func(params)
     if gcode:
         gcode.respond_info("Coordinate descent initial error: %s" % (best_err,))
     else:
         logging.info("Coordinate descent initial error: %s", best_err)
 
-    threshold = 0.00001
-    rounds = 0
+    height_candidates = [
+        'endstop_a', 'endstop_b', 'endstop_c',
+        'radius', 'tilt_x', 'tilt_y']
+    dist_candidates = [
+        'arm_a', 'arm_b', 'arm_c',
+        'angle_a', 'angle_b', 'angle_c']
+    
+    height_params = [p for p in height_candidates
+                     if p in params and p in adj_params]
+    dist_params = [p for p in dist_candidates
+                   if p in params and p in adj_params] + height_params
 
-    while sum(dp.values()) > threshold and rounds < 1000:
-        rounds += 1
-        for param_name in adj_params:
-            orig = params[param_name]
-            params[param_name] = orig + dp[param_name]
-            err = error_func(params)
-            if err < best_err:
-                # There was some improvement
-                best_err = err
-                dp[param_name] *= 1.1
-                continue
-            params[param_name] = orig - dp[param_name]
-            err = error_func(params)
-            if err < best_err:
-                # There was some improvement
-                best_err = err
-                dp[param_name] *= 1.1
-                continue
-            params[param_name] = orig
-            dp[param_name] *= 0.9
-        if rounds % 25 == 0:
-            gcode.respond_info("Delta error: %s   Rounds: %d" % (best_err, rounds))
+    best_val = 20 * (best_err[0] * best_err[1]) + (best_err[0] - best_err[1])**2 + 20 * best_err[1]
+    threshold = 0.00001
+    for cycle in range(5):
+        random.shuffle(height_params)
+        random.shuffle(dist_params)
+
+        rounds = 0
+        dp = {param_name: 1. for param_name in dist_params}
+        while dp and sum(dp.values()) > threshold and rounds < 500:
+            rounds += 1
+            for param_name in dist_params:
+                orig = params[param_name]
+                params[param_name] = orig + dp[param_name]
+                err = error_func(params)
+                if best_val > 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]:
+                    best_err = err
+                    best_val = 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]
+                    dp[param_name] *= 1.1
+                    continue
+                params[param_name] = orig - dp[param_name]
+                err = error_func(params)
+                if best_val > 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]:
+                    best_err = err
+                    best_val = 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]
+                    dp[param_name] *= 1.1
+                    continue
+                params[param_name] = orig
+                dp[param_name] *= 0.9
+            if gcode and rounds % 25 == 0:
+                gcode.respond_info(
+                    "Delta error: %s  Cycle: D%d  Rounds: %d" % (best_err, cycle, rounds))
+        if gcode:
+            gcode.respond_info(str(params))
+            
+        rounds = 0        
+        dp = {param_name: 1. for param_name in height_params}
+        while dp and sum(dp.values()) > threshold and rounds < 500:
+            rounds += 1
+            for param_name in height_params:
+                orig = params[param_name]
+                params[param_name] = orig + dp[param_name]
+                err = error_func(params)
+                if best_val > 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]:
+                    best_err = err
+                    best_val = 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]
+                    best_h = error_func(params)
+                    dp[param_name] *= 1.1
+                    continue
+                params[param_name] = orig - dp[param_name]
+                err = error_func(params)
+                if best_val > 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]:
+                    best_err = err
+                    best_val = 20 *(err[0] * err[1]) + (err[0] - err[1])**2 + 20 * err[1]
+                    dp[param_name] *= 1.1
+                    continue
+                params[param_name] = orig
+                dp[param_name] *= 0.9
+            if gcode and rounds % 25 == 0:
+                gcode.respond_info(
+                    "Delta error: %s  Cycle: H%d  Rounds: %d" % (best_err, cycle, rounds))
+        if gcode:
+            gcode.respond_info(str(params))
+            
+    final_rounds = rounds
     if gcode:
-        gcode.respond_info("Coordinate descent best_err: %s  rounds: %d" % (best_err, rounds))
+        gcode.respond_info(
+            "Coordinate descent best_err: %s  rounds: %d" % (best_err, final_rounds))
     else:
         logging.info("Coordinate descent best_err: %s  rounds: %d",
-                     best_err, rounds)
+                     best_err, final_rounds)
     return params
 
 # Helper to run the coordinate descent function in a background
@@ -159,3 +209,87 @@ def matrix_inv(a):
     return [matrix_mul(matrix_cross(x1, x2), inv_det),
             matrix_mul(matrix_cross(x2, x0), inv_det),
             matrix_mul(matrix_cross(x0, x1), inv_det)]
+
+
+
+
+    # params = dict(params)
+    # best_err = error_func(params)
+    # if gcode:
+    #     gcode.respond_info("Coordinate descent initial error: %s" % (best_err,))
+    # else:
+    #     logging.info("Coordinate descent initial error: %s", best_err)
+
+    # height_candidates = [
+    #     'endstop_a', 'endstop_b', 'endstop_c',
+    #     'radius', 'tilt_x', 'tilt_y']
+    # dist_candidates = [
+    #     'arm_a', 'arm_b', 'arm_c',
+    #     'angle_a', 'angle_b', 'angle_c']
+    
+    # height_params = [p for p in height_candidates
+    #                  if p in params and p in adj_params]
+    # dist_params = [p for p in dist_candidates
+    #                if p in params and p in adj_params] + height_params
+
+    # threshold = 0.00001
+    # for cycle in range(5):
+    #     random.shuffle(height_params)
+    #     random.shuffle(dist_params)
+
+    #     rounds = 0
+    #     dp = {param_name: 1. for param_name in dist_params}
+    #     while dp and sum(dp.values()) > threshold and rounds < 500:
+    #         rounds += 1
+    #         for param_name in dist_params:
+    #             orig = params[param_name]
+    #             params[param_name] = orig + dp[param_name]
+    #             err = error_func(params)
+    #             if err[1] < best_err[1]:
+    #                 best_err = err
+    #                 best_d = error_func(params)
+    #                 dp[param_name] *= 1.1
+    #                 continue
+    #             params[param_name] = orig - dp[param_name]
+    #             err = error_func(params)
+    #             if err[1] < best_err[1]:
+    #                 best_err = err
+    #                 best_d = error_func(params)
+    #                 dp[param_name] *= 1.1
+    #                 continue
+    #             params[param_name] = orig
+    #             dp[param_name] *= 0.9
+    #         if gcode and rounds % 25 == 0:
+    #             gcode.respond_info(
+    #                 "Delta error: %s  Cycle: D%d  Rounds: %d" % (best_err, cycle, rounds))
+    #     if gcode:
+    #         gcode.respond_info(str(params))
+            
+    #     rounds = 0        
+    #     dp = {param_name: 1. for param_name in height_params}
+    #     while dp and sum(dp.values()) > threshold and rounds < 500:
+    #         rounds += 1
+    #         for param_name in height_params:
+    #             orig = params[param_name]
+    #             params[param_name] = orig + dp[param_name]
+    #             err = error_func(params)
+    #             if err[0] < best_err[0]:
+    #                 best_err = err
+    #                 best_h = error_func(params)
+    #                 dp[param_name] *= 1.1
+    #                 continue
+    #             params[param_name] = orig - dp[param_name]
+    #             err = error_func(params)
+    #             if err[0] < best_err[0]:
+    #                 best_err = err
+    #                 best_h = error_func(params)
+    #                 dp[param_name] *= 1.1
+    #                 continue
+    #             params[param_name] = orig
+    #             dp[param_name] *= 0.9
+    #         if gcode and rounds % 25 == 0:
+    #             gcode.respond_info(
+    #                 "Delta error: %s  Cycle: H%d  Rounds: %d" % (best_err, cycle, rounds))
+    #     if gcode:
+    #         gcode.respond_info(str(params))
+    #         # gcode.respond_info(f"Best height error: {best_h}  Best distance error: {best_d}")
