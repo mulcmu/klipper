@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# Delta calibration performance testing tool - Phase 1: Data Generation
+# Delta calibration performance testing tool
 #
 # Generates simulated probe height measurements and distance measurement
 # stable positions from a [delta_true_calibration] config section,
-# and saves them to the [delta_calibrate] SAVE_CONFIG block in printer.cfg.
+# saves them to the [delta_calibrate] SAVE_CONFIG block, and optionally
+# runs the calibration optimization to mimic DELTA_CALIBRATE / DELTA_ANALYZE.
 #
 # Usage: delta_calibrate_test.py [options] <config_file>
 #
@@ -17,6 +18,25 @@ import argparse, configparser, io, math, os, sys
 MEASURE_ANGLES = [210., 270., 330., 30., 90., 150.]
 MEASURE_OUTER_RADIUS = 65.
 MEASURE_RIDGE_RADIUS = 5. - .5  # 4.5 mm
+
+# Probe pattern copied verbatim from delta_calibrate.py (named "37points" there
+# but actually contains 39 coordinate pairs).  Normalized coordinates are
+# multiplied by probe_radius to get the actual probe positions.
+HexagonProbePattern_37points = [
+    (0.31111, 0.48497), (-0.31111, 0.0), (0.15556, 0.24249),
+    (-0.46667, 0.72746), (-0.46667, -0.72746), (0.62222, 0.0),
+    (0.15556, -0.24249), (-0.62222, 0.0), (0.0, -0.48497),
+    (0.0, 0.96995), (-0.15556, 0.24249), (0.77778, 0.24249),
+    (0.77778, -0.24249), (0.0, 0.48497), (0.0, -0.96995),
+    (0.46667, 0.72746), (-0.15556, -0.24249), (0.46667, -0.72746),
+    (-0.31111, -0.48497), (0.31111, 0.0), (-0.46667, 0.24249),
+    (0.15556, 0.72746), (-0.46667, -0.24249), (-0.31111, 0.48497),
+    (-0.93333, 0.0), (0.62222, -0.48497), (0.15556, -0.72746),
+    (0.62222, 0.48497), (-0.62222, -0.48497), (-0.62222, 0.48497),
+    (0.0, 0.0), (0.46667, 0.24249), (0.31111, -0.48497),
+    (-0.15556, 0.72746), (-0.15556, -0.72746), (0.93333, 0.0),
+    (0.46667, -0.24249), (-0.77778, 0.24249), (-0.77778, -0.24249),
+]
 
 SAVE_CONFIG_HEADER = (
     "#*# <---------------------- SAVE_CONFIG ---------------------->")
@@ -71,6 +91,136 @@ class TrueDeltaCalibration:
             (ep - sp) / sd
             for sd, ep, sp in zip(self.stepdists, self.abs_endstops, steppos)
         ]
+
+
+######################################################################
+# Standalone math utilities for delta calibration
+######################################################################
+
+def _mat_dot(m1, m2):
+    return m1[0]*m2[0] + m1[1]*m2[1] + m1[2]*m2[2]
+
+def _mat_magsq(m1):
+    return m1[0]**2 + m1[1]**2 + m1[2]**2
+
+def _mat_add(m1, m2):
+    return [m1[0]+m2[0], m1[1]+m2[1], m1[2]+m2[2]]
+
+def _mat_sub(m1, m2):
+    return [m1[0]-m2[0], m1[1]-m2[1], m1[2]-m2[2]]
+
+def _mat_mul(m1, s):
+    return [m1[0]*s, m1[1]*s, m1[2]*s]
+
+def _mat_cross(m1, m2):
+    return [m1[1]*m2[2] - m1[2]*m2[1],
+            m1[2]*m2[0] - m1[0]*m2[2],
+            m1[0]*m2[1] - m1[1]*m2[0]]
+
+def trilateration(sphere_coords, radius2):
+    """Find the intersection of three spheres (trilateration).
+
+    sphere_coords: list of 3 sphere center (x, y, z) tuples
+    radius2:       list of 3 squared radii
+
+    Mirrors mathutil.trilateration from the klipper codebase.
+    """
+    sc1, sc2, sc3 = sphere_coords
+    s21 = _mat_sub(sc2, sc1)
+    s31 = _mat_sub(sc3, sc1)
+    d = math.sqrt(_mat_magsq(s21))
+    ex = _mat_mul(s21, 1. / d)
+    i = _mat_dot(ex, s31)
+    vect_ey = _mat_sub(s31, _mat_mul(ex, i))
+    ey = _mat_mul(vect_ey, 1. / math.sqrt(_mat_magsq(vect_ey)))
+    ez = _mat_cross(ex, ey)
+    j = _mat_dot(ey, s31)
+    x = (radius2[0] - radius2[1] + d**2) / (2. * d)
+    y = (radius2[0] - radius2[2] - x**2 + (x - i)**2 + j**2) / (2. * j)
+    z = -math.sqrt(radius2[0] - x**2 - y**2)
+    return _mat_add(sc1, _mat_add(_mat_mul(ex, x),
+                    _mat_add(_mat_mul(ey, y), _mat_mul(ez, z))))
+
+
+######################################################################
+# Delta calibration parameters (for optimization)
+######################################################################
+
+class DeltaCalibrationParams:
+    """Delta printer calibration parameters used in the optimization loop.
+
+    Mirrors DeltaCalibration from klippy/kinematics/delta.py, extended to
+    include bed_tilt parameters so they can be jointly optimized with the
+    delta geometry during coordinate descent.
+    """
+    def __init__(self, radius, angles, arms, endstops, stepdists,
+                 bed_tilt_x=0., bed_tilt_y=0.):
+        self.radius = radius
+        self.angles = angles
+        self.arms = arms
+        self.endstops = endstops
+        self.stepdists = stepdists
+        self.bed_tilt_x = bed_tilt_x
+        self.bed_tilt_y = bed_tilt_y
+        radian_angles = [math.radians(a) for a in angles]
+        self.towers = [(math.cos(a) * radius, math.sin(a) * radius)
+                       for a in radian_angles]
+        radius2 = radius ** 2
+        self.abs_endstops = [e + math.sqrt(a**2 - radius2)
+                             for e, a in zip(endstops, arms)]
+
+    def get_position_from_stable(self, stable_position):
+        """Convert a stable stepper position to cartesian (x, y, z) coordinates.
+
+        Mirrors DeltaCalibration.get_position_from_stable from delta.py.
+        """
+        sphere_coords = [
+            (t[0], t[1], es - sp * sd)
+            for sd, t, es, sp in zip(self.stepdists, self.towers,
+                                     self.abs_endstops, stable_position)
+        ]
+        return trilateration(sphere_coords, [a**2 for a in self.arms])
+
+    def coordinate_descent_params(self, is_extended):
+        """Return (adj_params, params) for coordinate descent optimization.
+
+        adj_params: tuple of parameter names to adjust during descent
+        params:     dict of current parameter values
+
+        bed_tilt_x and bed_tilt_y are always included as adjustment parameters.
+        With is_extended=True (distance measurements available), arm lengths
+        and tower angles are also included, matching DELTA_ANALYZE behavior.
+        """
+        adj_params = ('radius',
+                      'endstop_a', 'endstop_b', 'endstop_c',
+                      'bed_tilt_x', 'bed_tilt_y')
+        if is_extended:
+            adj_params += ('arm_a', 'arm_b', 'arm_c',
+                           'angle_a', 'angle_b', 'angle_c')
+        params = {
+            'radius': self.radius,
+            'bed_tilt_x': self.bed_tilt_x,
+            'bed_tilt_y': self.bed_tilt_y,
+        }
+        for i, axis in enumerate('abc'):
+            params['angle_' + axis] = self.angles[i]
+            params['arm_' + axis] = self.arms[i]
+            params['endstop_' + axis] = self.endstops[i]
+            params['stepdist_' + axis] = self.stepdists[i]
+        return adj_params, params
+
+    def new_calibration(self, params):
+        """Create a new DeltaCalibrationParams from a coordinate descent
+        params dict."""
+        radius = params['radius']
+        angles = [params['angle_' + a] for a in 'abc']
+        arms = [params['arm_' + a] for a in 'abc']
+        endstops = [params['endstop_' + a] for a in 'abc']
+        stepdists = [params['stepdist_' + a] for a in 'abc']
+        bed_tilt_x = params.get('bed_tilt_x', self.bed_tilt_x)
+        bed_tilt_y = params.get('bed_tilt_y', self.bed_tilt_y)
+        return DeltaCalibrationParams(radius, angles, arms, endstops, stepdists,
+                                      bed_tilt_x, bed_tilt_y)
 
 
 ######################################################################
@@ -170,7 +320,16 @@ def load_true_calibration(config):
         raise ValueError(
             "Config file is missing [delta_true_calibration] section.\n"
             "See the script comments for the required format.")
+    p = _load_calibration_section(config, section)
+    return TrueDeltaCalibration(**p)
 
+
+def _load_calibration_section(config, section):
+    """Load delta calibration parameters from a named config section.
+
+    Helper used by load_true_calibration and load_printer_calibration.
+    Returns a dict of parsed parameter values.
+    """
     _REQUIRED = object()
 
     def getfloat(key, fallback=_REQUIRED):
@@ -181,7 +340,6 @@ def load_true_calibration(config):
         raise ValueError(
             "Missing required parameter '%s' in [%s]" % (key, section))
 
-    # Arm lengths: support either a shared arm_length or per-tower values
     arm_shared = getfloat('arm_length', fallback=None)
     arm_a = getfloat('arm_length_a', fallback=arm_shared)
     if arm_a is None:
@@ -207,7 +365,7 @@ def load_true_calibration(config):
     bed_tilt_x = getfloat('bed_tilt_x', 0.)
     bed_tilt_y = getfloat('bed_tilt_y', 0.)
 
-    return TrueDeltaCalibration(
+    return dict(
         radius=radius,
         angles=[angle_a, angle_b, angle_c],
         arms=[arm_a, arm_b, arm_c],
@@ -218,23 +376,50 @@ def load_true_calibration(config):
     )
 
 
+def load_printer_calibration(config):
+    """Load initial printer calibration from the [delta_printer_calibration]
+    section.
+
+    This represents the starting parameters for the calibration optimization
+    (i.e. what the printer "thinks" it is before running DELTA_CALIBRATE).
+    Returns a DeltaCalibrationParams, or None if the section is absent.
+
+    Required parameters:
+      delta_radius      - radial distance from center to tower positions (mm)
+      endstop_a         - position_endstop for tower A (mm)
+      arm_length        - arm length shared by all towers, OR per-tower
+                          arm_length_a / arm_length_b / arm_length_c (mm)
+
+    Optional parameters (defaults shown):
+      endstop_b/c       - defaults to endstop_a
+      arm_length_b/c    - defaults to arm_length_a (or arm_length)
+      angle_a           - 210.0 (degrees)
+      angle_b           - 330.0 (degrees)
+      angle_c           - 90.0 (degrees)
+      stepdist_a        - 0.0001 (mm/step)
+      stepdist_b/c      - defaults to stepdist_a
+      bed_tilt_x        - 0.0 (mm/mm, initial bed tilt along X)
+      bed_tilt_y        - 0.0 (mm/mm, initial bed tilt along Y)
+    """
+    section = 'delta_printer_calibration'
+    if not config.has_section(section):
+        return None
+    p = _load_calibration_section(config, section)
+    return DeltaCalibrationParams(**p)
+
+
 ######################################################################
 # Probe height measurement generation
 ######################################################################
 
 def generate_probe_points(probe_radius):
-    """Generate the default probe point XY coordinates used by DELTA_CALIBRATE.
+    """Generate probe point XY coordinates matching DELTA_CALIBRATE's pattern.
 
-    Produces 7 points: the center and 6 scattered points around a circle of
-    the given probe_radius, matching the algorithm in DeltaCalibrate.__init__.
+    Uses the 37-point hexagon pattern from delta_calibrate.py, scaled by the
+    given probe_radius.
     """
-    points = [(0., 0.)]
-    scatter = [.95, .90, .85, .70, .75, .80]
-    for i in range(6):
-        r = math.radians(90. + 60. * i)
-        dist = probe_radius * scatter[i]
-        points.append((math.cos(r) * dist, math.sin(r) * dist))
-    return points
+    return [(x * probe_radius, y * probe_radius)
+            for x, y in HexagonProbePattern_37points]
 
 
 def generate_height_measurements(true_cal, probe_points):
@@ -245,14 +430,18 @@ def generate_height_measurements(true_cal, probe_points):
     computed using the true calibration geometry.
 
     Returns a list of (z_offset, stable_position) tuples, where:
-      z_offset        - measured Z height of the bed surface at that point
+      z_offset        - always 0.0 (the probe triggers at the bed surface)
       stable_position - 3-tuple of stepper steps from endstop (tower a, b, c)
+
+    On a physical printer the probe always fires at the bed surface, so the
+    recorded height offset is always 0.  Any bed tilt is captured entirely in
+    the stable stepper positions, not in the z_offset value.
     """
     measurements = []
     for x, y in probe_points:
         z = true_cal.bed_z(x, y)
         stable_pos = true_cal.calc_stable_position([x, y, z])
-        measurements.append((z, stable_pos))
+        measurements.append((0., stable_pos))
     return measurements
 
 
@@ -316,6 +505,127 @@ def generate_distance_measurements(true_cal, scale=1.0):
         outer_distances.append((dist, spos1, spos2))
 
     return center_distances + outer_distances
+
+
+######################################################################
+# Calibration optimization (mimicking DELTA_CALIBRATE / DELTA_ANALYZE)
+######################################################################
+
+# How much to weight distance measurements relative to height measurements.
+# Matches the MEASURE_WEIGHT constant in delta_calibrate.py.
+MEASURE_WEIGHT = 0.5
+
+
+def coordinate_descent(adj_params, params, error_func, initial_dp=None):
+    """Perform coordinate descent to minimize error_func.
+
+    Mirrors the coordinate_descent() function in klippy/mathutil.py but runs
+    in the current process without any klipper runtime dependencies.
+    initial_dp allows per-parameter initial step sizes (defaults to 1.0).
+    Returns (best_params, best_error, rounds).
+    """
+    params = dict(params)
+    dp = {p: (initial_dp.get(p, 1.) if initial_dp else 1.)
+          for p in adj_params}
+    best_err = error_func(params)
+    threshold = 0.00001
+    rounds = 0
+    while sum(dp.values()) > threshold and rounds < 100:
+        rounds += 1
+        for param_name in adj_params:
+            orig = params[param_name]
+            params[param_name] = orig + dp[param_name]
+            err = error_func(params)
+            if err < best_err:
+                best_err = err
+                dp[param_name] *= 1.1
+                continue
+            params[param_name] = orig - dp[param_name]
+            err = error_func(params)
+            if err < best_err:
+                best_err = err
+                dp[param_name] *= 1.1
+                continue
+            params[param_name] = orig
+            dp[param_name] *= 0.9
+    return params, best_err, rounds
+
+
+def calibrate_delta(printer_cal, height_positions, distances):
+    """Run delta calibration optimization, mimicking DELTA_CALIBRATE/DELTA_ANALYZE.
+
+    printer_cal:      DeltaCalibrationParams - initial (starting) calibration
+    height_positions: list of (z_offset, stable_pos) from probe measurements
+    distances:        list of (dist, stable_pos1, stable_pos2) from distance
+                      measurements (empty list for basic DELTA_CALIBRATE only)
+
+    When distances are provided (is_extended=True), arm lengths and angles are
+    also adjusted (DELTA_ANALYZE behavior), mirroring the extended calibration
+    in delta.py's coordinate_descent_params(is_extended=True).
+
+    bed_tilt_x and bed_tilt_y are always included as adjustment parameters so
+    bed tilt is separated from the delta geometry during calibration.
+
+    Returns (new_cal, best_error, rounds) where new_cal is a
+    DeltaCalibrationParams with the optimized parameters.
+    """
+    is_extended = bool(distances)
+    orig_cal = printer_cal
+    adj_params, params = orig_cal.coordinate_descent_params(is_extended)
+
+    # Use appropriate initial step sizes for each parameter type.
+    # bed_tilt parameters have much smaller typical values (~0.001 mm/mm)
+    # than geometric parameters (~1 mm / ~1 deg), so start with a smaller
+    # initial step to avoid wasting rounds shrinking dp down from 1.0.
+    initial_dp = {p: 1. for p in adj_params}
+    for p in adj_params:
+        if 'bed_tilt' in p:
+            initial_dp[p] = 0.001
+
+    z_weight = 1.
+    if distances:
+        z_weight = len(distances) / (MEASURE_WEIGHT * len(height_positions))
+
+    def delta_errorfunc(params):
+        try:
+            cal = orig_cal.new_calibration(params)
+            getpos = cal.get_position_from_stable
+            bed_tilt_x = params['bed_tilt_x']
+            bed_tilt_y = params['bed_tilt_y']
+            # Compute reconstructed cartesian positions for all probe points
+            positions = [getpos(spos) for _, spos in height_positions]
+            # Find the best-fit tilted plane z = bed_tilt_x*x + bed_tilt_y*y + tz
+            # and compute sum of squared deviations.  The optimal tz is the mean
+            # of the residuals (eliminates the constant offset analytically).
+            residuals = [z - bed_tilt_x * x - bed_tilt_y * y
+                         for x, y, z in positions]
+            z_mean = sum(residuals) / len(residuals)
+            height_error = sum((r - z_mean) ** 2 for r in residuals)
+            total_error = height_error * z_weight
+            # Distance error: horizontal (XY) distance between each ridge pair
+            for dist, sp1, sp2 in distances:
+                x1, y1, _z1 = getpos(sp1)
+                x2, y2, _z2 = getpos(sp2)
+                d = math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+                total_error += (d - dist) ** 2
+            return total_error
+        except (ValueError, ZeroDivisionError):
+            return 9e18
+
+    new_params, best_err, rounds = coordinate_descent(
+        adj_params, params, delta_errorfunc, initial_dp=initial_dp)
+    new_cal = orig_cal.new_calibration(new_params)
+    return new_cal, best_err, rounds
+
+
+def _print_calibration(cal):
+    """Print calibration parameters in a human-readable format."""
+    print("  delta_radius : %.6f mm" % cal.radius)
+    print("  arm lengths  : %.6f, %.6f, %.6f mm" % tuple(cal.arms))
+    print("  angles       : %.6f, %.6f, %.6f deg" % tuple(cal.angles))
+    print("  endstops     : %.6f, %.6f, %.6f mm" % tuple(cal.endstops))
+    print("  bed_tilt_x   : %.6f mm/mm" % cal.bed_tilt_x)
+    print("  bed_tilt_y   : %.6f mm/mm" % cal.bed_tilt_y)
 
 
 ######################################################################
@@ -451,13 +761,20 @@ def main():
         description=(
             "Generate simulated delta calibration probe height data and\n"
             "distance measurements from a [delta_true_calibration] config\n"
-            "section, and save them to the [delta_calibrate] section of\n"
-            "the printer.cfg SAVE_CONFIG block.\n"
+            "section, save them to the [delta_calibrate] section of the\n"
+            "printer.cfg SAVE_CONFIG block, and optionally run the calibration\n"
+            "optimization to mimic DELTA_CALIBRATE / DELTA_ANALYZE.\n"
             "\n"
             "The [delta_true_calibration] section defines the physical\n"
             "ground-truth parameters of the delta printer:\n"
             "  delta_radius, arm_length, endstop_a/b/c,\n"
-            "  angle_a/b/c, stepdist_a/b/c, bed_tilt_x, bed_tilt_y"
+            "  angle_a/b/c, stepdist_a/b/c, bed_tilt_x, bed_tilt_y\n"
+            "\n"
+            "The optional [delta_printer_calibration] section defines the\n"
+            "initial (starting) calibration for the optimization:\n"
+            "  same parameters as [delta_true_calibration]\n"
+            "If present, the script runs coordinate descent to find the best\n"
+            "calibration parameters and prints the results."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -472,6 +789,10 @@ def main():
     parser.add_argument(
         '--scale', type=float, default=1.0,
         help='Calibration object scale factor (default: 1.0)')
+    parser.add_argument(
+        '--no-calibrate', action='store_true',
+        help='Skip the calibration optimization step even if '
+             '[delta_printer_calibration] is present')
     opts = parser.parse_args()
 
     if not os.path.exists(opts.config):
@@ -483,6 +804,7 @@ def main():
         config, orig_lines, save_config_start = parse_klipper_config(
             opts.config)
         true_cal = load_true_calibration(config)
+        printer_cal = load_printer_calibration(config)
     except (ValueError, configparser.Error) as e:
         sys.stderr.write("Error reading config: %s\n" % e)
         sys.exit(1)
@@ -493,7 +815,7 @@ def main():
         probe_radius = config.getfloat('delta_calibrate', 'radius',
                                        fallback=50.)
 
-    # Print summary of loaded parameters
+    # Print summary of true (ground-truth) parameters
     print("True calibration parameters:")
     print("  delta_radius : %.4f mm" % true_cal.radius)
     print("  arm lengths  : %.4f, %.4f, %.4f mm" % tuple(true_cal.arms))
@@ -541,6 +863,52 @@ def main():
         update_config_file(opts.config, orig_lines, save_config_start,
                            height_measurements, distance_measurements)
         print("\nUpdated SAVE_CONFIG block in: %s" % opts.config)
+
+    # Run calibration optimization if [delta_printer_calibration] is present
+    if printer_cal is not None and not opts.no_calibrate:
+        print("\n--- Calibration optimization ---")
+        print("Initial printer calibration (starting point):")
+        _print_calibration(printer_cal)
+
+        calibration_type = ("extended (DELTA_CALIBRATE + DELTA_ANALYZE)"
+                            if distance_measurements
+                            else "basic (DELTA_CALIBRATE)")
+        print("\nRunning %s calibration..." % calibration_type)
+
+        new_cal, best_err, rounds = calibrate_delta(
+            printer_cal, height_measurements, distance_measurements)
+
+        print("Completed in %d rounds, final error: %.6g" % (rounds, best_err))
+        print("\nCalibrated parameters:")
+        _print_calibration(new_cal)
+
+        print("\nDelta from true parameters:")
+        print("  delta_radius : %+.6f mm" % (new_cal.radius - true_cal.radius))
+        for i, axis in enumerate('abc'):
+            print("  arm_%s        : %+.6f mm"
+                  % (axis, new_cal.arms[i] - true_cal.arms[i]))
+        for i, axis in enumerate('abc'):
+            print("  angle_%s      : %+.6f deg"
+                  % (axis, new_cal.angles[i] - true_cal.angles[i]))
+        for i, axis in enumerate('abc'):
+            print("  endstop_%s   : %+.6f mm"
+                  % (axis, new_cal.endstops[i] - true_cal.endstops[i]))
+        print("  bed_tilt_x   : %+.6f mm/mm"
+              % (new_cal.bed_tilt_x - true_cal.bed_tilt_x))
+        print("  bed_tilt_y   : %+.6f mm/mm"
+              % (new_cal.bed_tilt_y - true_cal.bed_tilt_y))
+
+        print("\nSuggested printer config changes:")
+        print("  [printer]")
+        print("  delta_radius: %.6f" % new_cal.radius)
+        for i, axis in enumerate('abc'):
+            print("  [stepper_%s]" % axis)
+            print("  angle: %.6f" % new_cal.angles[i])
+            print("  arm_length: %.6f" % new_cal.arms[i])
+            print("  position_endstop: %.6f" % new_cal.endstops[i])
+        print("  [bed_tilt]")
+        print("  x_adjust: %.6f" % new_cal.bed_tilt_x)
+        print("  y_adjust: %.6f" % new_cal.bed_tilt_y)
 
 
 if __name__ == '__main__':
