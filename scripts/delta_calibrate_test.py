@@ -12,7 +12,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import print_function
-import argparse, configparser, io, math, os, sys
+import argparse, configparser, io, math, os, random, sys
 
 # Calibration object geometry constants (matching delta_calibrate.py)
 MEASURE_ANGLES = [210., 270., 330., 30., 90., 150.]
@@ -422,7 +422,7 @@ def generate_probe_points(probe_radius):
             for x, y in HexagonProbePattern_37points]
 
 
-def generate_height_measurements(true_cal, probe_points):
+def generate_height_measurements(true_cal, probe_points, noise=0.):
     """Generate simulated probe height measurements at each probe point.
 
     For each (x, y) probe position the bed surface height is determined by
@@ -436,10 +436,17 @@ def generate_height_measurements(true_cal, probe_points):
     On a physical printer the probe always fires at the bed surface, so the
     recorded height offset is always 0.  Any bed tilt is captured entirely in
     the stable stepper positions, not in the z_offset value.
+
+    When noise > 0 a uniform random perturbation in [-noise, +noise] mm is
+    added to the probe trigger height, simulating probe repeatability error.
+    The perturbation shifts all three stepper stable positions by the same
+    amount (it is a pure Z-direction noise), leaving z_offset at 0.
     """
     measurements = []
     for x, y in probe_points:
         z = true_cal.bed_z(x, y)
+        if noise:
+            z += random.uniform(-noise, noise)
         stable_pos = true_cal.calc_stable_position([x, y, z])
         measurements.append((0., stable_pos))
     return measurements
@@ -449,7 +456,7 @@ def generate_height_measurements(true_cal, probe_points):
 # Distance measurement generation
 ######################################################################
 
-def generate_distance_measurements(true_cal, scale=1.0):
+def generate_distance_measurements(true_cal, scale=1.0, noise=0.):
     """Generate simulated distance measurements from calibration object ridges.
 
     Computes stable positions for the inner and outer ridge locations of the
@@ -460,6 +467,11 @@ def generate_distance_measurements(true_cal, scale=1.0):
     same format that DELTA_ANALYZE writes to the [delta_calibrate] section.
     The list contains 12 entries (6 center + 6 outer), matching the output
     of measurements_to_distances() in delta_calibrate.py.
+
+    When noise > 0 a uniform random perturbation in [-noise, +noise] mm is
+    added to each recorded distance, simulating caliper measurement error.
+    The stable positions are not affected; only the measured distance value
+    is perturbed.
     """
     obj_angles = list(map(math.radians, MEASURE_ANGLES))
     xy_angles = list(zip(map(math.cos, obj_angles), map(math.sin, obj_angles)))
@@ -482,6 +494,8 @@ def generate_distance_measurements(true_cal, scale=1.0):
         spos2 = true_cal.calc_stable_position([op[0], op[1], oz])
         # Caliper (horizontal) distance between ridge centers along the spoke
         dist = MEASURE_OUTER_RADIUS * scale
+        if noise:
+            dist += random.uniform(-noise, noise)
         center_distances.append((dist, spos1, spos2))
 
     # --- Outer measurements: pairs of adjacent spokes ---
@@ -502,6 +516,8 @@ def generate_distance_measurements(true_cal, scale=1.0):
         spos2 = true_cal.calc_stable_position([sp_pt[0], sp_pt[1], sz])
         # Caliper (horizontal) distance between the two outer ridge centers
         dist = math.sqrt((sp_pt[0] - fp[0])**2 + (sp_pt[1] - fp[1])**2)
+        if noise:
+            dist += random.uniform(-noise, noise)
         outer_distances.append((dist, spos1, spos2))
 
     return center_distances + outer_distances
@@ -793,6 +809,13 @@ def main():
         '--no-calibrate', action='store_true',
         help='Skip the calibration optimization step even if '
              '[delta_printer_calibration] is present')
+    parser.add_argument(
+        '--noise', type=float, default=0.0, metavar='MM',
+        help='Maximum magnitude of uniform random noise added to simulated '
+             'measurements (default: 0.0).  Probe height measurements are '
+             'perturbed by a random value in [-MM, +MM] mm applied to the '
+             'probe trigger height; distance measurements are perturbed by a '
+             'random value in [-MM, +MM] mm applied to the recorded distance.')
     opts = parser.parse_args()
 
     if not os.path.exists(opts.config):
@@ -828,16 +851,19 @@ def main():
     print("Probe radius   : %.2f mm" % probe_radius)
     if opts.scale != 1.0:
         print("Object scale   : %.4f" % opts.scale)
+    if opts.noise:
+        print("Noise magnitude: %.6f mm" % opts.noise)
 
     # Generate probe height measurements
     probe_points = generate_probe_points(probe_radius)
-    height_measurements = generate_height_measurements(true_cal, probe_points)
+    height_measurements = generate_height_measurements(
+        true_cal, probe_points, opts.noise)
 
     # Generate distance measurements (unless disabled)
     distance_measurements = []
     if not opts.no_distances:
         distance_measurements = generate_distance_measurements(
-            true_cal, opts.scale)
+            true_cal, opts.scale, opts.noise)
 
     print("\nGenerated %d height measurements and %d distance measurements"
           % (len(height_measurements), len(distance_measurements)))
