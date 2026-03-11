@@ -20,8 +20,9 @@ MEASURE_OUTER_RADIUS = 65.
 MEASURE_RIDGE_RADIUS = 5. - .5  # 4.5 mm
 
 # Probe pattern copied verbatim from delta_calibrate.py (named "37points" there
-# but actually contains 39 coordinate pairs).  Normalized coordinates are
-# multiplied by probe_radius to get the actual probe positions.
+# but actually contains 39 coordinate pairs).  The name is kept as-is to match
+# the upstream source.  Normalized coordinates are multiplied by probe_radius to
+# get the actual probe positions.
 HexagonProbePattern_37points = [
     (0.31111, 0.48497), (-0.31111, 0.0), (0.15556, 0.24249),
     (-0.46667, 0.72746), (-0.46667, -0.72746), (0.62222, 0.0),
@@ -644,6 +645,43 @@ def _print_calibration(cal):
     print("  bed_tilt_y   : %.6f mm/mm" % cal.bed_tilt_y)
 
 
+def simulate_bed_mesh(true_cal, cal_params, probe_radius, count=7):
+    """Simulate a bed mesh using the given calibration parameters.
+
+    Generates a rectangular grid of (count x count) points clipped to the
+    circular probe area of the given radius.  For each point the probe is
+    assumed to fire at the true bed surface; the calibrated printer then
+    reconstructs a cartesian Z from the resulting stable stepper positions.
+
+    Returns a list of (x, y, mesh_z, true_z) tuples where:
+      mesh_z - Z value the calibrated printer would record at (x, y)
+      true_z - true bed height from true_cal.bed_z(x, y)
+    """
+    results = []
+    for i in range(count):
+        for j in range(count):
+            x = probe_radius * (-1. + 2. * i / (count - 1))
+            y = probe_radius * (-1. + 2. * j / (count - 1))
+            if x ** 2 + y ** 2 > probe_radius ** 2:
+                continue
+            true_z = true_cal.bed_z(x, y)
+            stable_pos = true_cal.calc_stable_position([x, y, true_z])
+            _mx, _my, mesh_z = cal_params.get_position_from_stable(stable_pos)
+            results.append((x, y, mesh_z, true_z))
+    return results
+
+
+def _print_mesh_metrics(label, mesh_results):
+    """Print bed mesh min/max statistics for a simulate_bed_mesh() result."""
+    mesh_z = [mz for _x, _y, mz, _tz in mesh_results]
+    errors = [mz - tz for _x, _y, mz, tz in mesh_results]
+    print("%s (%d points):" % (label, len(mesh_results)))
+    print("  Mesh Z   : min %+.6f  max %+.6f  range %.6f mm"
+          % (min(mesh_z), max(mesh_z), max(mesh_z) - min(mesh_z)))
+    print("  True bed error: min %+.6f  max %+.6f  range %.6f mm"
+          % (min(errors), max(errors), max(errors) - min(errors)))
+
+
 ######################################################################
 # Output formatting and config file update
 ######################################################################
@@ -935,6 +973,13 @@ def main():
         print("  [bed_tilt]")
         print("  x_adjust: %.6f" % new_cal.bed_tilt_x)
         print("  y_adjust: %.6f" % new_cal.bed_tilt_y)
+
+        # Bed mesh simulation: compare initial and calibrated results
+        print("\n--- Bed mesh simulation ---")
+        initial_mesh = simulate_bed_mesh(true_cal, printer_cal, probe_radius)
+        _print_mesh_metrics("Before calibration", initial_mesh)
+        final_mesh = simulate_bed_mesh(true_cal, new_cal, probe_radius)
+        _print_mesh_metrics("After calibration", final_mesh)
 
 
 if __name__ == '__main__':
