@@ -688,7 +688,8 @@ def generate_ring_distance_measurements(true_cal, initial_cal, probe_radius,
 MEASURE_WEIGHT = 0.5
 
 
-def coordinate_descent(adj_params, params, error_func, initial_dp=None):
+def coordinate_descent(adj_params, params, error_func, initial_dp=None,
+                       max_rounds=50000):
     """Perform coordinate descent to minimize error_func.
 
     Mirrors the coordinate_descent() function in klippy/mathutil.py but runs
@@ -702,7 +703,7 @@ def coordinate_descent(adj_params, params, error_func, initial_dp=None):
     best_err = error_func(params)
     threshold = 0.00001
     rounds = 0
-    while sum(dp.values()) > threshold and rounds < 50000:
+    while sum(dp.values()) > threshold and rounds < max_rounds:
         rounds += 1
         for param_name in adj_params:
             orig = params[param_name]
@@ -726,7 +727,46 @@ def coordinate_descent(adj_params, params, error_func, initial_dp=None):
     return params, best_err, rounds
 
 
-def calibrate_delta(printer_cal, height_positions, distances):
+def _fit_plane(positions):
+    """Fit the least-squares plane z = a*x + b*y + c to a list of (x, y, z) points.
+
+    Solves the 3x3 normal equations via Cramer's rule in a single pass.
+    Falls back to (0., 0., mean_z) for degenerate inputs (all points
+    coincident or collinear).
+
+    Returns (a, b, c).
+    """
+    n = len(positions)
+    sx = sy = sz = sx2 = sy2 = sxy = sxz = syz = 0.
+    for x, y, z in positions:
+        sx  += x;    sy  += y;    sz  += z
+        sx2 += x*x;  sy2 += y*y;  sxy += x*y
+        sxz += x*z;  syz += y*z
+    m = [[sx2, sxy, sx],
+         [sxy, sy2, sy],
+         [sx,  sy,  float(n)]]
+    v = [sxz, syz, sz]
+
+    def _det(mat):
+        return (mat[0][0] * (mat[1][1]*mat[2][2] - mat[1][2]*mat[2][1])
+              - mat[0][1] * (mat[1][0]*mat[2][2] - mat[1][2]*mat[2][0])
+              + mat[0][2] * (mat[1][0]*mat[2][1] - mat[1][1]*mat[2][0]))
+
+    D = _det(m)
+    if abs(D) < 1e-12:
+        return 0., 0., (sz / n if n else 0.)
+
+    def _cramer(col):
+        mc = [[m[i][j] if j != col else v[i] for j in range(3)]
+              for i in range(3)]
+        return _det(mc) / D
+
+    return _cramer(0), _cramer(1), _cramer(2)
+
+
+def calibrate_delta(printer_cal, height_positions, distances,
+                    measure_weight=MEASURE_WEIGHT, tower_offset=0.10,
+                    max_rounds=50000):
     """Run delta calibration optimization, mimicking DELTA_CALIBRATE/DELTA_ANALYZE.
 
     printer_cal:      DeltaCalibrationParams - initial (starting) calibration
@@ -738,8 +778,12 @@ def calibrate_delta(printer_cal, height_positions, distances):
     also adjusted (DELTA_ANALYZE behavior), mirroring the extended calibration
     in delta.py's coordinate_descent_params(is_extended=True).
 
-    bed_tilt_x and bed_tilt_y are always included as adjustment parameters so
-    bed tilt is separated from the delta geometry during calibration.
+    The height error is the sum of squared residuals from the best-fit plane
+    z = a*x + b*y + c fitted analytically to the reconstructed probe positions.
+    This makes the error insensitive to flat, tilted, and gently non-planar
+    (bowl, dome, saddle) physical beds.  bed_tilt_x and bed_tilt_y are
+    determined from the final best-fit plane slope rather than via coordinate
+    descent, since any linear component is absorbed by the plane.
 
     Returns (new_cal, best_error, rounds) where new_cal is a
     DeltaCalibrationParams with the optimized parameters.
@@ -748,52 +792,54 @@ def calibrate_delta(printer_cal, height_positions, distances):
     orig_cal = printer_cal
     adj_params, params = orig_cal.coordinate_descent_params(is_extended)
 
-    # Use appropriate initial step sizes for each parameter type.
-    # bed_tilt parameters have much smaller typical values (~0.001 mm/mm)
-    # than geometric parameters (~1 mm / ~1 deg), so start with a smaller
-    # initial step to avoid wasting rounds shrinking dp down from 1.0.
+    # bed_tilt_x/y are determined analytically from the best-fit plane of the
+    # reconstructed probe positions (see delta_errorfunc below).  Varying them
+    # via coordinate descent would have no effect on the plane residuals, so
+    # remove them from the set of adjusted parameters.
+    adj_params = tuple(p for p in adj_params
+                       if p not in ('bed_tilt_x', 'bed_tilt_y'))
     initial_dp = {p: 1. for p in adj_params}
-    for p in adj_params:
-        if 'bed_tilt' in p:
-            initial_dp[p] = 0.01
 
     z_weight = 1.
     if distances:
-        z_weight = len(distances) / (MEASURE_WEIGHT * len(height_positions))
+        z_weight = len(distances) / (measure_weight * len(height_positions))
 
     def delta_errorfunc(params):
         try:
             cal = orig_cal.new_calibration(params)
             getpos = cal.get_position_from_stable
-            bed_tilt_x = params['bed_tilt_x']
-            bed_tilt_y = params['bed_tilt_y']
-            # Compute reconstructed cartesian positions for all probe points
+
+            # Reconstruct Cartesian positions for all probe points.
             positions = [getpos(spos) for _, spos in height_positions]
-            # Find the best-fit tilted plane z = bed_tilt_x*x + bed_tilt_y*y + tz
-            # and compute sum of squared deviations.  The optimal tz is the mean
-            # of the residuals (eliminates the constant offset analytically).
-            residuals = [z - bed_tilt_x * x - bed_tilt_y * y
-                         for x, y, z in positions]
-            z_mean = sum(residuals) / len(residuals)
-            # height_error = sum((r - z_mean) ** 2 for r in residuals)
-            height_error = sum((r) ** 2 for r in residuals)
+
+            # Fit the best-fit plane z = a*x + b*y + c analytically.
+            # Residuals from this plane are the true geometric calibration
+            # errors: any flat, tilted, or gently non-planar bed shape
+            # (bowl, dome, saddle) is captured by the plane and does not
+            # mislead the optimizer into distorting the delta geometry.
+            a, b, c = _fit_plane(positions)
+            height_error = sum(
+                (z - a*x - b*y )**2 for x, y, z in positions
+            )
             
             total_error = height_error * z_weight
             
             #orgin should be lowest travel point in xy plane
             towers = cal.calc_tower_from_position((0., 0., 0.))
             
-            TOWER_OFFSET = .10 #mm offset to add to each tower height for distance error calculation 
-            #add offset to each tower height
-            t_a = [towers[0] + TOWER_OFFSET, towers[1], towers[2]]            
-            t_b = [towers[0], towers[1] + TOWER_OFFSET, towers[2]]
-            t_c = [towers[0], towers[1], towers[2] + TOWER_OFFSET]
-            
-            z_a = cal.get_position_from_tower(t_a)[2]
-            z_b = cal.get_position_from_tower(t_b)[2]
-            z_c = cal.get_position_from_tower(t_c)[2]
-            
-            total_error += (z_a - z_b) ** 2 + (z_b - z_c) ** 2 + (z_c - z_a) ** 2
+            # Nudge each carriage by tower_offset in turn and record the
+            # resulting toolhead Z.  Equal Z responses => balanced towers.
+            tower_zs = [
+                cal.get_position_from_tower(
+                    [h + (tower_offset if i == k else 0.)
+                     for i, h in enumerate(towers)]
+                )[2]
+                for k in range(3)
+            ]
+            total_error += 25 * sum(
+                (tower_zs[a] - tower_zs[b]) ** 2
+                for a, b in ((0, 1), (1, 2), (2, 0))
+            )
                                     
             # Distance error: horizontal (XY) distance between each ridge pair
             for dist, sp1, sp2 in distances:
@@ -806,7 +852,18 @@ def calibrate_delta(printer_cal, height_positions, distances):
             return 9e18
 
     new_params, best_err, rounds = coordinate_descent(
-        adj_params, params, delta_errorfunc, initial_dp=initial_dp)
+        adj_params, params, delta_errorfunc, initial_dp=initial_dp,
+        max_rounds=max_rounds)
+
+    # Determine the final bed_tilt analytically from the best-fit plane of
+    # the reconstructed probe positions under the converged calibration.
+    final_cal_tmp = orig_cal.new_calibration(new_params)
+    final_positions = [final_cal_tmp.get_position_from_stable(spos)
+                       for _, spos in height_positions]
+    tilt_a, tilt_b, _ = _fit_plane(final_positions)
+    new_params['bed_tilt_x'] = tilt_a
+    new_params['bed_tilt_y'] = tilt_b
+
     new_cal = orig_cal.new_calibration(new_params)
     return new_cal, best_err, rounds
 
@@ -1140,6 +1197,17 @@ def main():
     parser.add_argument(
         '--verbose', action='store_true',
         help='Print generated measurements and calibration results in detail')
+    parser.add_argument(
+        '--max-rounds', type=int, default=50000, metavar='N',
+        help='Maximum coordinate descent rounds (default: 50000)')
+    parser.add_argument(
+        '--measure-weight', type=float, default=MEASURE_WEIGHT, metavar='W',
+        help='Relative weight of height vs distance measurements '
+             '(default: %.2f)' % MEASURE_WEIGHT)
+    parser.add_argument(
+        '--tower-offset', type=float, default=0.10, metavar='MM',
+        help='Carriage nudge size used in tower-balance error term '
+             '(default: 0.10 mm)')
     opts = parser.parse_args()
 
     if not os.path.exists(opts.config):
@@ -1237,7 +1305,10 @@ def main():
         print("\nRunning %s calibration..." % calibration_type)
 
         new_cal, best_err, rounds = calibrate_delta(
-            printer_cal, height_measurements, distance_measurements)
+            printer_cal, height_measurements, distance_measurements,
+            measure_weight=opts.measure_weight,
+            tower_offset=opts.tower_offset,
+            max_rounds=opts.max_rounds)
 
         print("Completed in %d rounds, final error: %.6g" % (rounds, best_err))
         print("\nCalibrated parameters:")
@@ -1289,8 +1360,8 @@ def main():
         # Carriage-sum charts
         print("\n--- Carriage-sum charts ---")
         chart_prefix = os.path.splitext(opts.config)[0] + '_carriage_sum'
-        generate_carriage_charts(printer_cal, new_cal,
-                                 out_prefix=chart_prefix)
+        generate_carriage_charts(printer_cal, new_cal, 
+                                 out_prefix=chart_prefix, half_range=50)
 
 
 if __name__ == '__main__':
