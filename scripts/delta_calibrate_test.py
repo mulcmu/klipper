@@ -432,6 +432,7 @@ def _load_calibration_section(config, section):
     )
 
 
+def load_real_printer_calibration(config):
     """Load a DeltaCalibrationParams from a real klipper printer.cfg.
 
     Reads geometry from the [printer] section (delta_radius) and the
