@@ -432,6 +432,121 @@ def _load_calibration_section(config, section):
     )
 
 
+    """Load a DeltaCalibrationParams from a real klipper printer.cfg.
+
+    Reads geometry from the [printer] section (delta_radius) and the
+    [stepper_a], [stepper_b], [stepper_c] sections (arm_length,
+    position_endstop, angle).  Step distance is derived from
+    rotation_distance + microsteps when present, or step_distance directly.
+
+    Returns a DeltaCalibrationParams, or raises ValueError if required
+    parameters are absent.
+    """
+    def getfloat(section, key, fallback=None):
+        if config.has_option(section, key):
+            return config.getfloat(section, key)
+        return fallback
+
+    if not config.has_section('printer'):
+        raise ValueError("Config missing [printer] section")
+    radius = getfloat('printer', 'delta_radius')
+    if radius is None:
+        raise ValueError("[printer] missing delta_radius")
+
+    arms, endstops, angles, stepdists = [], [], [], []
+    default_endstop = None
+    default_arm = None
+    for i, axis in enumerate('abc'):
+        sec = 'stepper_' + axis
+        if not config.has_section(sec):
+            raise ValueError("Config missing [%s] section" % sec)
+
+        arm = getfloat(sec, 'arm_length', default_arm)
+        if arm is None:
+            raise ValueError("[%s] missing arm_length" % sec)
+        if i == 0:
+            default_arm = arm
+
+        ep = getfloat(sec, 'position_endstop', default_endstop)
+        if ep is None:
+            raise ValueError("[%s] missing position_endstop" % sec)
+        if i == 0:
+            default_endstop = ep
+
+        default_angle = [210., 330., 90.][i]
+        angle = getfloat(sec, 'angle', default_angle)
+
+        # Compute step distance: prefer rotation_distance+microsteps,
+        # fall back to step_distance, then a safe default.
+        # stepdist = rotation_distance / (full_steps_per_rotation * microsteps)
+        rotation_dist = getfloat(sec, 'rotation_distance')
+        microsteps = getfloat(sec, 'microsteps')
+        full_steps = getfloat(sec, 'full_steps_per_rotation', 200.)
+        step_distance = getfloat(sec, 'step_distance')
+        if rotation_dist is not None and microsteps is not None:
+            sd = rotation_dist / (microsteps * full_steps)
+        elif step_distance is not None:
+            sd = step_distance
+        else:
+            sd = 0.0001  # fallback
+
+        arms.append(arm)
+        endstops.append(ep)
+        angles.append(angle)
+        stepdists.append(sd)
+
+    # Bed tilt from [bed_tilt] if present
+    tilt_x = getfloat('bed_tilt', 'x_adjust', 0.)
+    tilt_y = getfloat('bed_tilt', 'y_adjust', 0.)
+
+    return DeltaCalibrationParams(
+        radius=radius, angles=angles, arms=arms,
+        endstops=endstops, stepdists=stepdists,
+        bed_tilt_x=tilt_x, bed_tilt_y=tilt_y)
+
+
+def load_delta_calibrate_data(config):
+    """Load height and distance measurements from the [delta_calibrate] section.
+
+    Reads height0/height0_pos ... and distance0/distance0_pos1/distance0_pos2
+    entries that klipper writes into the SAVE_CONFIG block after DELTA_CALIBRATE
+    / DELTA_ANALYZE.
+
+    Returns (height_measurements, distance_measurements) in the same tuple
+    format used by the rest of the script, or raises ValueError if the section
+    is absent or contains no height data.
+    """
+    section = 'delta_calibrate'
+    if not config.has_section(section):
+        raise ValueError("Config missing [delta_calibrate] section")
+
+    def parse_stable(s):
+        return [float(v) for v in s.split(',')]
+
+    height_measurements = []
+    for i in range(200):
+        h = config.getfloat(section, 'height%d' % i, fallback=None) \
+            if config.has_option(section, 'height%d' % i) else None
+        if h is None:
+            break
+        pos_str = config.get(section, 'height%d_pos' % i)
+        height_measurements.append((h, parse_stable(pos_str)))
+
+    if not height_measurements:
+        raise ValueError("[delta_calibrate] contains no height measurements")
+
+    distance_measurements = []
+    for i in range(200):
+        if not config.has_option(section, 'distance%d' % i):
+            break
+        d = config.getfloat(section, 'distance%d' % i)
+        p1 = parse_stable(config.get(section, 'distance%d_pos1' % i))
+        p2 = parse_stable(config.get(section, 'distance%d_pos2' % i))
+        distance_measurements.append((d, p1, p2))
+
+    return height_measurements, distance_measurements
+
+
 def load_printer_calibration(config):
     """Load initial printer calibration from the [delta_printer_calibration]
     section.
@@ -813,13 +928,18 @@ def calibrate_delta(printer_cal, height_positions, distances,
             positions = [getpos(spos) for _, spos in height_positions]
 
             # Fit the best-fit plane z = a*x + b*y + c analytically.
-            # Residuals from this plane are the true geometric calibration
-            # errors: any flat, tilted, or gently non-planar bed shape
-            # (bowl, dome, saddle) is captured by the plane and does not
-            # mislead the optimizer into distorting the delta geometry.
+            # The tilt coefficients (a, b) are removed from the residuals so
+            # that non-planar bed shapes (bowl, dome, saddle) do not mislead
+            # the optimizer into distorting the delta geometry.
+            #
+            # The constant offset (c) is intentionally NOT subtracted.
+            # If it were, a uniform Z shift of all probe points would change
+            # only c with zero effect on the residuals, allowing endstops to
+            # drift to arbitrary absolute heights without penalty.  Keeping c
+            # in the residual pins the absolute Z level and prevents that drift.
             a, b, c = _fit_plane(positions)
             height_error = sum(
-                (z - a*x - b*y )**2 for x, y, z in positions
+                (z - a*x - b*y)**2 for x, y, z in positions
             )
             
             total_error = height_error * z_weight
@@ -854,7 +974,7 @@ def calibrate_delta(printer_cal, height_positions, distances,
     new_params, best_err, rounds = coordinate_descent(
         adj_params, params, delta_errorfunc, initial_dp=initial_dp,
         max_rounds=max_rounds)
-
+    
     # Determine the final bed_tilt analytically from the best-fit plane of
     # the reconstructed probe positions under the converged calibration.
     final_cal_tmp = orig_cal.new_calibration(new_params)
@@ -874,6 +994,7 @@ def _print_calibration(cal):
     print("  arm lengths  : %.6f, %.6f, %.6f mm" % tuple(cal.arms))
     print("  angles       : %.6f, %.6f, %.6f deg" % tuple(cal.angles))
     print("  endstops     : %.6f, %.6f, %.6f mm" % tuple(cal.endstops))
+    print("  stepdists    : %.6f, %.6f, %.6f mm/step" % tuple(cal.stepdists))
     print("  bed_tilt_x   : %.6f mm/mm" % cal.bed_tilt_x)
     print("  bed_tilt_y   : %.6f mm/mm" % cal.bed_tilt_y)
 
@@ -915,6 +1036,40 @@ def _print_mesh_metrics(label, mesh_results):
           % (min(errors), max(errors), max(errors) - min(errors)))
 
 
+def _print_height_summary(label, cal, height_measurements):
+    """Print a table of reconstructed probe Z heights for a calibration."""
+    positions = [cal.get_position_from_stable(spos)
+                 for _, spos in height_measurements]
+    zs = [p[2] for p in positions]
+    a, b, c = _fit_plane(positions)
+    residuals = [z - a*x - b*y - c for x, y, z in positions]
+    print("%s (%d probes):" % (label, len(height_measurements)))
+    print("  Z range   : min %+.4f  max %+.4f  span %.4f mm"
+          % (min(zs), max(zs), max(zs) - min(zs)))
+    print("  Plane tilt: x=%+.6f  y=%+.6f mm/mm  z0=%.4f mm"
+          % (a, b, c))
+    rms = math.sqrt(sum(r**2 for r in residuals) / len(residuals))
+    print("  Residuals : min %+.4f  max %+.4f  rms %.4f mm"
+          % (min(residuals), max(residuals), rms))
+
+
+def _print_distance_summary(label, cal, distances):
+    """Print a table of reconstructed vs measured distances."""
+    print("%s (%d distances):" % (label, len(distances)))
+    reconstructed = []
+    for i, (dist, sp1, sp2) in enumerate(distances):
+        x1, y1, _ = cal.get_position_from_stable(sp1)
+        x2, y2, _ = cal.get_position_from_stable(sp2)
+        d = math.sqrt((x1-x2)**2 + (y1-y2)**2)
+        reconstructed.append(d)
+        print("  dist%-3d  measured=%8.4f  recon=%8.4f  err=%+.4f mm"
+              % (i, dist, d, d - dist))
+    errors = [r - d for r, (d, _, __) in zip(reconstructed, distances)]
+    rms = math.sqrt(sum(e**2 for e in errors) / len(errors))
+    print("  Error: min %+.4f  max %+.4f  rms %.4f mm"
+          % (min(errors), max(errors), rms))
+
+
 def _print_distance_metrics(label, cal, distances):
     """Print distance measurement accuracy metrics for a calibration.
 
@@ -933,6 +1088,69 @@ def _print_distance_metrics(label, cal, distances):
     print("%s (%d measurements):" % (label, len(distances)))
     print("  Distance error: min %+.6f  max %+.6f  rms %.6f mm"
           % (min(errors), max(errors), rms))
+
+
+######################################################################
+# Probe height scatter charts
+######################################################################
+
+def generate_probe_height_charts(height_measurements, cal_initial,
+                                 cal_final, out_prefix):
+    """Generate scatter charts of reconstructed probe Z heights.
+
+    Produces two PNG files:
+      <out_prefix>_probe_heights_initial.png  -- Z under initial calibration
+      <out_prefix>_probe_heights_final.png    -- Z under optimized calibration
+
+    Each chart is a scatter plot of the probe XY positions coloured by the
+    reconstructed Z height.  The best-fit plane is shown as contours so
+    remaining non-planar residuals are visible.
+    """
+    if not HAS_MATPLOTLIB:
+        print("Warning: matplotlib not available -- skipping probe height charts.")
+        return
+    import numpy as np
+
+    datasets = [
+        (cal_initial, 'Probe heights - initial calibration',
+         out_prefix + '_probe_heights_initial.png'),
+        (cal_final,   'Probe heights - optimized calibration',
+         out_prefix + '_probe_heights_final.png'),
+    ]
+    for cal, title, filename in datasets:
+        positions = [cal.get_position_from_stable(spos)
+                     for _, spos in height_measurements]
+        xs = np.array([p[0] for p in positions])
+        ys = np.array([p[1] for p in positions])
+        zs = np.array([p[2] for p in positions])
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        sc = ax.scatter(xs, ys, c=zs, cmap='RdYlGn', s=50, zorder=3)
+        cb = fig.colorbar(sc, ax=ax)
+        cb.set_label('Reconstructed Z (mm)')
+
+        # Overlay best-fit plane residuals as a filled contour background
+        if len(positions) >= 3:
+            # Grid for contour
+            margin = max(np.ptp(xs), np.ptp(ys)) * 0.1 or 5.
+            gx = np.linspace(xs.min() - margin, xs.max() + margin, 60)
+            gy = np.linspace(ys.min() - margin, ys.max() + margin, 60)
+            GX, GY = np.meshgrid(gx, gy)
+            a, b, c = _fit_plane(positions)
+            GZ = a * GX + b * GY + c
+            ax.contourf(GX, GY, GZ, levels=12, cmap='RdYlGn',
+                        alpha=0.25, zorder=1)
+            ax.contour(GX, GY, GZ, levels=12, colors='gray',
+                       linewidths=0.4, alpha=0.5, zorder=2)
+
+        ax.set_title(title)
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        ax.set_aspect('equal')
+        fig.tight_layout()
+        fig.savefig(filename, dpi=150)
+        plt.close(fig)
+        print('Wrote probe height chart: %s' % filename)
 
 
 ######################################################################
@@ -1218,6 +1436,24 @@ def main():
     try:
         config, orig_lines, save_config_start = parse_klipper_config(
             opts.config)
+    except (ValueError, configparser.Error) as e:
+        sys.stderr.write("Error reading config: %s\n" % e)
+        sys.exit(1)
+
+    # Decide which mode to run: simulation (with [delta_true_calibration])
+    # or real-printer (load measurements from [delta_calibrate]).
+    has_true_cal = config.has_section('delta_true_calibration')
+
+    if has_true_cal:
+        _run_simulation_mode(config, orig_lines, save_config_start, opts)
+    else:
+        _run_real_printer_mode(config, orig_lines, save_config_start, opts)
+
+
+def _run_simulation_mode(config, orig_lines, save_config_start, opts):
+    """Original simulation path: generate synthetic measurements from
+    [delta_true_calibration] and optionally run optimization."""
+    try:
         true_cal = load_true_calibration(config)
         printer_cal = load_printer_calibration(config)
     except (ValueError, configparser.Error) as e:
@@ -1360,8 +1596,88 @@ def main():
         # Carriage-sum charts
         print("\n--- Carriage-sum charts ---")
         chart_prefix = os.path.splitext(opts.config)[0] + '_carriage_sum'
-        generate_carriage_charts(printer_cal, new_cal, 
+        generate_carriage_charts(printer_cal, new_cal,
                                  out_prefix=chart_prefix, half_range=50)
+
+
+def _run_real_printer_mode(config, orig_lines, save_config_start, opts):
+    """Real-printer path: load geometry and measurements from [printer],
+    [stepper_a/b/c], and the [delta_calibrate] SAVE_CONFIG block, then
+    run the calibration optimizer."""
+    try:
+        printer_cal = load_real_printer_calibration(config)
+        height_measurements, distance_measurements = \
+            load_delta_calibrate_data(config)
+    except (ValueError, configparser.Error) as e:
+        sys.stderr.write("Error reading config: %s\n" % e)
+        sys.exit(1)
+
+    probe_radius = 50.
+    if config.has_section('delta_calibrate'):
+        probe_radius = config.getfloat('delta_calibrate', 'radius',
+                                       fallback=50.)
+
+    print("Real printer calibration (loaded from config):")
+    _print_calibration(printer_cal)
+    print("Probe radius : %.2f mm" % probe_radius)
+    print("\nLoaded %d height measurements and %d distance measurements"
+          % (len(height_measurements), len(distance_measurements)))
+
+    if opts.no_calibrate:
+        return
+
+    calibration_type = ("extended (DELTA_CALIBRATE + DELTA_ANALYZE)"
+                        if distance_measurements
+                        else "basic (DELTA_CALIBRATE)")
+    print("\nRunning %s calibration..." % calibration_type)
+
+    new_cal, best_err, rounds = calibrate_delta(
+        printer_cal, height_measurements, distance_measurements,
+        measure_weight=opts.measure_weight,
+        tower_offset=opts.tower_offset,
+        max_rounds=opts.max_rounds)
+
+    print("Completed in %d rounds, final error: %.6g" % (rounds, best_err))
+    print("\nOptimized calibration parameters:")
+    _print_calibration(new_cal)
+
+    print("\nSuggested printer config changes:")
+    print("[printer]")
+    print("  delta_radius: %.6f" % new_cal.radius)
+    for i, axis in enumerate('abc'):
+        print("[stepper_%s]" % axis)
+        print("  angle: %.6f" % new_cal.angles[i])
+        print("  arm_length: %.6f" % new_cal.arms[i])
+        print("  position_endstop: %.6f" % new_cal.endstops[i])
+    print("[bed_tilt]")
+    print("  x_adjust: %.6f" % new_cal.bed_tilt_x)
+    print("  y_adjust: %.6f" % new_cal.bed_tilt_y)
+
+    # --- Height summary ---
+    print("\n--- Probe height summary ---")
+    _print_height_summary("Before calibration", printer_cal, height_measurements)
+    _print_height_summary("After calibration",  new_cal,     height_measurements)
+
+    # --- Distance summary ---
+    if distance_measurements:
+        print("\n--- Distance summary ---")
+        _print_distance_summary("Before calibration", printer_cal,
+                                distance_measurements)
+        print()
+        _print_distance_summary("After calibration",  new_cal,
+                                distance_measurements)
+
+    # --- Probe height charts ---
+    chart_prefix = os.path.splitext(opts.config)[0]
+    print("\n--- Probe height charts ---")
+    generate_probe_height_charts(height_measurements, printer_cal, new_cal,
+                                 chart_prefix)
+
+    # --- Carriage-sum charts ---
+    print("\n--- Carriage-sum charts ---")
+    generate_carriage_charts(printer_cal, new_cal,
+                             out_prefix=chart_prefix + '_carriage_sum',
+                             half_range=probe_radius)
 
 
 if __name__ == '__main__':
